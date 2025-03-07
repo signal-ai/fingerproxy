@@ -4,6 +4,9 @@
 package reverseproxy
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -15,7 +18,7 @@ type HTTPHandler struct {
 	// required, internal reverse proxy that forwards the requests
 	reverseProxy *httputil.ReverseProxy
 
-	// required, the URL that requests will be forwarding to
+	// the URL that requests will be forwarding to if the `X-Forwarded-Host` is not set
 	To *url.URL
 
 	// optional, preserve the host in outbound requests
@@ -45,11 +48,36 @@ func NewHTTPHandler(to *url.URL, reverseProxy *httputil.ReverseProxy, headerInje
 	}
 
 	f.reverseProxy.Rewrite = f.rewriteFunc
+	f.reverseProxy.ErrorHandler = f.errorHandler
 	return f
 }
 
+type contextKey string
+
+const (
+    proxyErrorKey contextKey = "proxyError"
+)
 func (f *HTTPHandler) rewriteFunc(r *httputil.ProxyRequest) {
-	r.SetURL(f.To)
+	if destination := r.In.Header.Get("X-Destination"); destination != ""  {
+		targetURL, err := url.Parse(destination)
+        if err != nil {
+			ctx := context.WithValue(r.In.Context(), proxyErrorKey, errors.New("Invalid X-Destination"))
+			r.In = r.In.WithContext(ctx)
+
+            // Set to a non-routable address
+            targetURL, _ = url.Parse("http://127.0.0.1:1")
+		} else {
+			f.logf("using target url %v", targetURL.String())
+		}
+		r.SetURL(targetURL)
+		r.Out.Header.Del("X-Destination")
+	} else if f.To != nil {
+		r.SetURL(f.To)
+	}  else {
+		ctx := context.WithValue(r.In.Context(), proxyErrorKey, errors.New("No URL provided"))
+		r.In = r.In.WithContext(ctx)
+	}
+
 	r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
 	r.SetXForwarded()
 
@@ -65,6 +93,16 @@ func (f *HTTPHandler) rewriteFunc(r *httputil.ProxyRequest) {
 			r.Out.Header.Set(k, v)
 		}
 	}
+}
+
+func (f *HTTPHandler) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	if proxyErr, ok := r.Context().Value(proxyErrorKey).(error); ok {
+		http.Error(w, fmt.Sprintf("Proxy error: %s", proxyErr), http.StatusBadGateway)
+		return
+	}
+
+	// Handle standard transport errors
+	http.Error(w, fmt.Sprintf("Proxy error: %s", err), http.StatusBadGateway)
 }
 
 func (f *HTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
