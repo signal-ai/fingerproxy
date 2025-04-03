@@ -1,4 +1,4 @@
-module github.com/wi1dcard/fingerproxy
+module github.com/signal-ai/fingerproxy
 
 go 1.21.7
 
